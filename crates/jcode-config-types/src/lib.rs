@@ -605,6 +605,15 @@ pub struct AgentsConfig {
     /// ```
     #[serde(default)]
     pub preset: BTreeMap<String, AgentPreset>,
+
+    /// Name of the preset to activate on startup.
+    ///
+    /// Must match a key in `preset`. If unset or not found, no preset is
+    /// active on startup (use `/preset <name>` to activate one at runtime).
+    /// `/preset <name>` updates the session state but does NOT persist back
+    /// here; set this to make a preset the default across sessions.
+    #[serde(default)]
+    pub active_preset: Option<String>,
 }
 
 /// A named agent preset: a bundle of agent configurations.
@@ -680,6 +689,7 @@ impl Default for AgentsConfig {
             memory_embedding_dim: None,
             swarm_max_concurrent_agents: default_swarm_max_concurrent_agents(),
             preset: BTreeMap::new(),
+            active_preset: None,
         }
     }
 }

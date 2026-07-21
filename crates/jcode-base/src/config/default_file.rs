@@ -424,6 +424,10 @@ swarm_max_concurrent_agents = 32
 # [agents.preset.fast-team.reviewer]
 # model = "gpt-5.5"
 # effort = "high"
+#
+# Active preset on startup (must match a key above). When set, the coordinator
+# starts with that preset's agents available via "spawn @<nickname> <task>".
+# active_preset = "default"
 
 [terminal]
 # Without a hook, clients inside tmux automatically use a right-side pane.

@@ -532,7 +532,12 @@ impl App {
             improve_mode,
             last_injected_memory_signature: None,
             swarm_enabled: features.swarm,
-            active_agent_preset: None,
+            active_agent_preset: crate::config::config()
+                .agents
+                .active_preset
+                .as_ref()
+                .filter(|name| !name.trim().is_empty())
+                .map(|name| name.trim().to_string()),
             debug_force_inline_gallery: false,
             swarm_panel_selected: 0,
             swarm_panel_focused: false,
@@ -957,7 +962,12 @@ impl App {
             improve_mode,
             last_injected_memory_signature: None,
             swarm_enabled: features.swarm,
-            active_agent_preset: None,
+            active_agent_preset: crate::config::config()
+                .agents
+                .active_preset
+                .as_ref()
+                .filter(|name| !name.trim().is_empty())
+                .map(|name| name.trim().to_string()),
             debug_force_inline_gallery: false,
             swarm_panel_selected: 0,
             swarm_panel_focused: false,
