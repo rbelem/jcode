@@ -407,6 +407,23 @@ swarm_max_concurrent_agents = 32
 # memory_embedding_model = "text-embedding-3-small"
 # memory_embedding_base_url = "https://api.openai.com/v1"
 # memory_embedding_dim = 1536
+#
+# Named agent presets: bundles of agent configurations that can be activated
+# with `/preset <name>`. Each preset contains named agents; the agent named
+# "default" provides the coordinator's own model/effort. When active, spawn
+# a configured agent by telling the coordinator: "spawn @<nickname> <task>".
+#
+# [agents.preset.default.coordinator]
+# model = "glm-5.2"
+# effort = "medium"
+#
+# [agents.preset.default.scout]
+# model = "glm-4.7-flash"
+# effort = "low"
+#
+# [agents.preset.fast-team.reviewer]
+# model = "gpt-5.5"
+# effort = "high"
 
 [terminal]
 # Without a hook, clients inside tmux automatically use a right-side pane.

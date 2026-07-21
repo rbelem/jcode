@@ -229,6 +229,8 @@ pub struct ContextInfo {
     pub prompt_overlay_chars: usize,
     /// Preferred tools section size (chars)
     pub preferred_tools_chars: usize,
+    /// Agent presets section size (chars)
+    pub presets_chars: usize,
     // === Dynamic (Conversation) ===
     /// Tool definitions sent to API (chars)
     pub tool_defs_chars: usize,
@@ -271,6 +273,7 @@ impl ContextInfo {
             + self.memory_chars
             + self.prompt_overlay_chars
             + self.preferred_tools_chars
+            + self.presets_chars
             + self.tool_defs_chars
     }
 
@@ -440,6 +443,27 @@ pub fn build_system_prompt_full_with_capabilities(
     // Add active skill prompt
     if let Some(skill) = skill_prompt {
         parts.push(format!("# Active Skill\n\n{}", skill));
+    }
+
+    // Add defined agent presets (if any) so the coordinator knows available
+    // nicknames and can translate "spawn @nickname <task>" into the right
+    // model/effort. Only includes presets, not the active one (session state).
+    let presets = &crate::config::config().agents.preset;
+    if !presets.is_empty() {
+        let mut section = "# Agent Presets\n\nNamed agent configurations the user can activate with `/preset <name>`. When a preset is active and the user says \"spawn @<nickname> <task>\", use that nickname's model/effort in the swarm spawn call.\n\n".to_string();
+        for (preset_name, preset) in presets {
+            section.push_str(&format!("## Preset `{preset_name}`\n"));
+            for (agent_name, agent) in &preset.agent {
+                let model = agent.model.as_deref().unwrap_or("(inherit)");
+                let effort = agent.effort.as_deref().unwrap_or("(inherit)");
+                let tag = if agent_name == "default" { " [coordinator]" } else { "" };
+                section.push_str(&format!(
+                    "- `@{agent_name}`: model={model}, effort={effort}{tag}\n"
+                ));
+            }
+        }
+        info.presets_chars = section.len();
+        parts.push(section);
     }
 
     let prompt = parts.join("\n\n");

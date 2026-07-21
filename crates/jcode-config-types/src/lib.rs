@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub mod keybindings;
 pub use keybindings::{
@@ -585,6 +586,56 @@ pub struct AgentsConfig {
     /// Env override: `JCODE_SWARM_MAX_CONCURRENT_AGENTS`.
     #[serde(default = "default_swarm_max_concurrent_agents")]
     pub swarm_max_concurrent_agents: usize,
+
+    /// Named agent presets, keyed by preset name.
+    ///
+    /// Each preset is a collection of named agent configurations. The agent
+    /// named `default` (or the first one if `default` is absent) is the
+    /// coordinator's own config. `/preset <name>` activates a preset.
+    ///
+    /// Example:
+    /// ```toml
+    /// [agents.preset.default.coordinator]
+    /// model = "glm-5.2"
+    /// effort = "medium"
+    ///
+    /// [agents.preset.default.scout]
+    /// model = "glm-4.7-flash"
+    /// effort = "low"
+    /// ```
+    #[serde(default)]
+    pub preset: BTreeMap<String, AgentPreset>,
+}
+
+/// A named agent preset: a bundle of agent configurations.
+///
+/// Each agent within the preset is identified by a nickname (e.g.
+/// `coordinator`, `scout`, `reviewer`). The coordinator's own model/effort
+/// comes from the agent named `"default"` if present, otherwise the first
+/// agent in the map.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentPreset {
+    /// Named agent configurations within this preset.
+    /// The key is the agent nickname.
+    #[serde(default)]
+    pub agent: BTreeMap<String, AgentPresetAgent>,
+}
+
+/// Configuration for a single agent within a preset.
+///
+/// When `/preset <name>` is active, spawning an agent via `@nickname <task>`
+/// uses these settings. The coordinator uses the `default` agent's settings.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentPresetAgent {
+    /// Model identifier (e.g. "glm-5.2", "gpt-5.5", "claude-api:claude-fable-5").
+    /// If unset, inherits the coordinator's active model.
+    #[serde(default)]
+    pub model: Option<String>,
+
+    /// Reasoning effort (none|minimal|low|medium|high|xhigh|max).
+    /// If unset, inherits the coordinator's active effort.
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 fn default_swarm_max_concurrent_agents() -> usize {
@@ -628,6 +679,7 @@ impl Default for AgentsConfig {
             memory_embedding_base_url: None,
             memory_embedding_dim: None,
             swarm_max_concurrent_agents: default_swarm_max_concurrent_agents(),
+            preset: BTreeMap::new(),
         }
     }
 }
@@ -1619,4 +1671,70 @@ pub struct LaunchHotkeysConfig {
     /// Set true once auto-import has populated `entries`, so we only bake the
     /// per-repo mapping a single time and never clobber later user edits.
     pub imported: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_preset_serde_roundtrip() {
+        let mut agents = BTreeMap::new();
+        let mut default_preset = AgentPreset::default();
+        default_preset.agent.insert(
+            "coordinator".to_string(),
+            AgentPresetAgent {
+                model: Some("glm-5.2".to_string()),
+                effort: Some("medium".to_string()),
+            },
+        );
+        default_preset.agent.insert(
+            "scout".to_string(),
+            AgentPresetAgent {
+                model: Some("glm-4.7-flash".to_string()),
+                effort: Some("low".to_string()),
+            },
+        );
+        agents.insert("default".to_string(), default_preset);
+
+        let mut fast = AgentPreset::default();
+        fast.agent.insert(
+            "reviewer".to_string(),
+            AgentPresetAgent {
+                model: Some("gpt-5.5".to_string()),
+                effort: Some("high".to_string()),
+            },
+        );
+        agents.insert("fast-team".to_string(), fast);
+
+        let config = AgentsConfig {
+            preset: agents,
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: AgentsConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.preset.len(), 2);
+        assert!(restored.preset.contains_key("default"));
+        assert!(restored.preset.contains_key("fast-team"));
+
+        let default = &restored.preset["default"];
+        assert_eq!(default.agent.len(), 2);
+        assert_eq!(
+            default.agent["coordinator"].model.as_deref(),
+            Some("glm-5.2")
+        );
+        assert_eq!(default.agent["scout"].effort.as_deref(), Some("low"));
+
+        let fast = &restored.preset["fast-team"];
+        assert_eq!(fast.agent["reviewer"].model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(fast.agent["reviewer"].effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn agent_preset_empty_default() {
+        let cfg = AgentsConfig::default();
+        assert!(cfg.preset.is_empty());
+    }
 }

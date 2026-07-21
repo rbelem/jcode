@@ -1979,6 +1979,92 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
         return true;
     }
 
+    // Agent presets: named bundles of agent configurations.
+    //   /preset              — show active preset and list available ones
+    //   /preset <name>       — switch to a named preset
+    //   /preset off          — deactivate presets (use normal spawn defaults)
+    //   /preset list         — list all defined presets
+    if trimmed == "/preset" || trimmed == "/preset status" || trimmed == "/preset list" {
+        let cfg = crate::config::config();
+        let active = app.active_agent_preset();
+        let available: Vec<&str> = cfg.agents.preset.keys().map(|k| k.as_str()).collect();
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "Active preset: {}",
+            active.unwrap_or("(none")
+        ));
+        if available.is_empty() {
+            lines.push(
+                "No presets defined. Add [agents.preset.<name>.<agent-nickname>] sections to config.toml.".to_string(),
+            );
+        } else {
+            lines.push(format!("Available presets: {}", available.join(", ")));
+            for name in &available {
+                let preset = &cfg.agents.preset[*name];
+                let agents: Vec<&str> = preset.agent.keys().map(|k| k.as_str()).collect();
+                let marker = if active == Some(*name) { " ← active" } else { "" };
+                lines.push(format!(
+                    "  {} [agents: {}]{marker}",
+                    name,
+                    agents.join(", ")
+                ));
+            }
+        }
+        app.push_display_message(DisplayMessage::system(lines.join("\n")));
+        return true;
+    }
+
+    if trimmed == "/preset off" {
+        let _ = app.set_active_agent_preset(None);
+        app.set_status_notice("Preset: OFF");
+        app.push_display_message(DisplayMessage::system(
+            "Agent presets deactivated. Spawns use normal defaults.".to_string(),
+        ));
+        return true;
+    }
+
+    if let Some(name) = trimmed.strip_prefix("/preset ") {
+        let name = name.trim();
+        match app.set_active_agent_preset(Some(name)) {
+            Ok(()) => {
+                app.set_status_notice(&format!("Preset: {}", name));
+                // Build a summary of agents in this preset so the coordinator
+                // (and the user) can see the available nicknames and their
+                // model/effort settings.
+                let cfg = crate::config::config();
+                let mut lines = vec![format!("Active agent preset: {name}")];
+                if let Some(preset) = cfg.agents.preset.get(name) {
+                    lines.push("Agents:".to_string());
+                    for (agent_name, agent) in &preset.agent {
+                        let model = agent.model.as_deref().unwrap_or("(inherit)");
+                        let effort = agent.effort.as_deref().unwrap_or("(inherit)");
+                        let tag = if agent_name == "default" { " [coordinator]" } else { "" };
+                        lines.push(format!(
+                            "  @{agent_name} → model={model}, effort={effort}{tag}"
+                        ));
+                    }
+                    lines.push(
+                        "Spawn an agent from this preset by telling the coordinator: \
+                         \"spawn @<nickname> to <task>\"."
+                            .to_string(),
+                    );
+                }
+                app.push_display_message(DisplayMessage::system(lines.join("\n")));
+            }
+            Err(err) => {
+                app.push_display_message(DisplayMessage::error(err));
+            }
+        }
+        return true;
+    }
+
+    if trimmed.starts_with("/preset") {
+        app.push_display_message(DisplayMessage::error(
+            "Usage: /preset [name|off|list]".to_string(),
+        ));
+        return true;
+    }
+
     if trimmed == "/rewind undo" {
         let Some(snapshot) = app.rewind_undo_snapshot.take() else {
             app.push_display_message(DisplayMessage::system("No rewind to undo.".to_string()));

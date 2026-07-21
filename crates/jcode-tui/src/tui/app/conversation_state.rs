@@ -605,6 +605,44 @@ impl App {
         }
     }
 
+    /// Returns the active agent preset name, if any.
+    pub fn active_agent_preset(&self) -> Option<&str> {
+        self.active_agent_preset.as_deref()
+    }
+
+    /// Sets the active agent preset. Validates the name exists in config.
+    /// Returns an error string if the preset is not defined.
+    pub(super) fn set_active_agent_preset(&mut self, name: Option<&str>) -> Result<(), String> {
+        match name {
+            None => {
+                self.active_agent_preset = None;
+                Ok(())
+            }
+            Some(name) => {
+                let cfg = crate::config::config();
+                let name = name.trim();
+                if name.is_empty() {
+                    self.active_agent_preset = None;
+                    return Ok(());
+                }
+                if !cfg.agents.preset.contains_key(name) {
+                    let available: Vec<&str> = cfg.agents.preset.keys().map(|k| k.as_str()).collect();
+                    return Err(format!(
+                        "Unknown preset '{}'. Available presets: {}",
+                        name,
+                        if available.is_empty() {
+                            "(none defined)".to_string()
+                        } else {
+                            available.join(", ")
+                        }
+                    ));
+                }
+                self.active_agent_preset = Some(name.to_string());
+                Ok(())
+            }
+        }
+    }
+
     pub(super) fn extract_thought_line(text: &str) -> Option<String> {
         let trimmed = text.trim();
         if trimmed.starts_with("Thought for ") && trimmed.ends_with('s') {
