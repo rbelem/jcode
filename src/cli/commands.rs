@@ -2022,8 +2022,15 @@ pub async fn run_browser(action: &str) -> Result<()> {
 struct ModelListReport {
     provider: String,
     selected_model: String,
-    models: Vec<String>,
+    models: Vec<ModelListEntry>,
     routes: Vec<ModelListRouteReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct ModelListEntry {
+    model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    efforts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2032,6 +2039,8 @@ struct ModelListRouteReport {
     model: String,
     method: String,
     available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    efforts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3158,54 +3167,228 @@ pub async fn run_model_command(
         eprintln!("Warning: failed to refresh dynamic model list: {}", err);
     }
 
+    // When the OpenAI API-key channel is a proxy gateway that also serves a
+    // sibling profile (e.g. opencode-go also serves opencode zen), fetch the
+    // sibling profile's model catalog so its free/exclusive models appear in
+    // the list. This is best-effort: failures are silently ignored.
+    let mut sibling_models: Vec<(String, &'static str)> = Vec::new();
+    if let Some(proxy_id) = proxy_profile_id_from_openai_base_url() {
+        for sibling_id in sibling_profile_ids(&proxy_id) {
+            if let Ok(models) = fetch_profile_models(sibling_id).await {
+                for model in models {
+                    sibling_models.push((model, sibling_id));
+                }
+            }
+        }
+    }
+
     let routes = provider.model_routes();
     let filtered_routes = filter_cli_model_routes_for_choice(choice, &routes);
-    let models = if filtered_routes.len() == routes.len() {
-        collect_cli_model_names(&routes, provider.available_models_display())
+
+    // Filter to available routes. When the OpenAI API-key channel is actually
+    // a proxy gateway (detected via OPENAI_BASE_URL), reattribute those routes
+    // to the matching OpenAI-compatible profile (e.g. opencode-go). Some proxy
+    // profiles serve sibling profiles too (e.g. opencode-go serves opencode
+    // zen models), so we list under both. Non-OpenAI models with a dedicated
+    // vendor profile also get a copy under that vendor.
+    let mut available_routes: Vec<crate::provider::ModelRoute> = Vec::new();
+    let proxy_profile = proxy_profile_id_from_openai_base_url();
+    for route in filtered_routes.iter().filter(|r| r.available) {
+        if proxy_profile.is_some()
+            && route.api_method_kind() == crate::provider::ModelRouteApiMethod::OpenAIApiKey
+        {
+            // Replace the openai-api route with the proxy profile route.
+            available_routes.push(reattribute_route(route));
+            // Add sibling profile routes (e.g. opencode-go also serves
+            // opencode zen models via the same endpoint).
+            for sibling in sibling_profile_ids(&proxy_profile.clone().unwrap()) {
+                available_routes.push(crate::provider::ModelRoute {
+                    model: route.model.clone(),
+                    provider: profile_display_name(sibling),
+                    api_method: format!("openai-compatible:{sibling}"),
+                    available: route.available,
+                    detail: route.detail.clone(),
+                    cheapness: route.cheapness.clone(),
+                });
+            }
+            // Also add a vendor profile copy for non-OpenAI models, but only
+            // if that vendor profile is independently configured (has its own
+            // API key). Without this check, every model on the proxy would
+            // get a phantom vendor route the user never set up.
+            if crate::provider::provider_for_model(&route.model) != Some("openai") {
+                if let Some(vendor_id) = profile_id_for_model(&route.model)
+                    && vendor_profile_is_configured(vendor_id)
+                {
+                    available_routes.push(crate::provider::ModelRoute {
+                        model: route.model.clone(),
+                        provider: profile_display_name(vendor_id),
+                        api_method: format!("openai-compatible:{vendor_id}"),
+                        available: route.available,
+                        detail: route.detail.clone(),
+                        cheapness: route.cheapness.clone(),
+                    });
+                }
+            }
+        } else {
+            available_routes.push(route.clone());
+            // No proxy: still reattribute non-OpenAI models to their vendor,
+            // but only if the vendor profile is independently configured.
+            let reattributed = reattribute_route(route);
+            if reattributed.api_method != route.api_method {
+                // Check the vendor profile is configured before adding.
+                let method = reattributed.api_method_kind();
+                if let crate::provider::ModelRouteApiMethod::OpenAiCompatible { profile_id: Some(ref id) } = method {
+                    if vendor_profile_is_configured(id) {
+                        available_routes.push(reattributed);
+                    }
+                } else {
+                    available_routes.push(reattributed);
+                }
+            }
+        }
+    }
+
+    // Inject sibling profile models (e.g. OpenCode Zen free models) that were
+    // fetched from the sibling endpoint. These are models not available via
+    // the proxy's own catalog.
+    for (model, profile_id) in &sibling_models {
+        // Skip if this model is already listed under this exact profile.
+        let already = available_routes.iter().any(|r| {
+            r.model == *model && r.api_method == format!("openai-compatible:{profile_id}")
+        });
+        if !already {
+            available_routes.push(crate::provider::ModelRoute {
+                model: model.clone(),
+                provider: profile_display_name(profile_id),
+                api_method: format!("openai-compatible:{profile_id}"),
+                available: true,
+                detail: "sibling profile catalog".to_string(),
+                cheapness: None,
+            });
+        }
+    }
+
+    let raw_models = if available_routes.is_empty() {
+        // Fall back to provider's own display list if no routes are marked
+        // available (e.g. catalog hasn't hydrated yet).
+        collect_cli_model_names(&filtered_routes, provider.available_models_display())
     } else {
-        collect_cli_model_names(&filtered_routes, Vec::new())
+        collect_cli_model_names(&available_routes, Vec::new())
     };
 
-    if models.is_empty() {
+    if raw_models.is_empty() {
         anyhow::bail!(
             "No models found for provider '{}'. Check credentials or try a different --provider.",
             provider.name()
         );
     }
 
+    // Build model → reasoning-efforts lookup.
+    //
+    // For OpenAI OAuth models, the Codex backend advertises
+    // `supported_reasoning_levels` per model, which we cache at startup. For
+    // Claude reasoning models the effort ladder is model-derived. For other
+    // providers we fall back to None (effort not advertised).
+    let openai_efforts = crate::provider::cached_openai_reasoning_efforts()
+        .unwrap_or_default();
+    let provider_name = provider.name();
+    let provider_display =
+        crate::provider_catalog::runtime_provider_display_name(provider_name);
+
+    let efforts_for_model = |model: &str| -> Option<Vec<String>> {
+        // OpenAI cached catalog first (exact match).
+        if let Some(efforts) = openai_efforts.get(model) {
+            return Some(efforts.clone());
+        }
+        // Fall back to the provider/model-derived effort ladder. This covers
+        // Claude reasoning models (via AnthropicReasoningCaps), OpenAI models
+        // not yet in the cached catalog, OpenRouter, and DeepSeek.
+        let inferred = crate::provider::inferred_reasoning_efforts(
+            crate::provider::provider_for_model(model),
+            Some(model),
+        );
+        if inferred.is_empty() {
+            None
+        } else {
+            // Exclude the Jcode UI sentinels (swarm/swarm-deep) — they are not
+            // real provider effort levels, just internal orchestration markers.
+            let filtered: Vec<String> = inferred
+                .into_iter()
+                .filter(|e| *e != "swarm" && *e != "swarm-deep")
+                .map(String::from)
+                .collect();
+            (!filtered.is_empty()).then_some(filtered)
+        }
+    };
+
     if emit_json {
+        let entries: Vec<ModelListEntry> = raw_models
+            .iter()
+            .map(|model| ModelListEntry {
+                model: model.clone(),
+                efforts: efforts_for_model(model),
+            })
+            .collect();
         let provider_label = super::provider_init::login_provider_for_choice(choice)
             .map(|provider| provider.display_name.to_string())
-            .unwrap_or_else(|| {
-                crate::provider_catalog::runtime_provider_display_name(provider.name())
-            });
+            .unwrap_or_else(|| provider_display.clone());
         let report = ModelListReport {
             provider: provider_label,
             selected_model: provider.model(),
-            models,
-            routes: filtered_routes
+            models: entries,
+            routes: available_routes
                 .iter()
                 .map(|route| ModelListRouteReport {
                     provider: cli_route_provider_display(&route.provider, &route.api_method),
                     model: route.model.clone(),
                     method: cli_api_method_display(&route.api_method),
                     available: route.available,
+                    efforts: efforts_for_model(&route.model),
                 })
                 .collect(),
         };
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
+        // Build one output line per available route. The same model can appear
+        // under multiple providers (e.g. minimax-m3 via both OpenCode proxy and
+        // the MiniMax OpenAI-compatible profile).
+        //
+        // Provider keys match what goes in config.toml: `claude`, `openai`,
+        // `openai-compatible:zai`, etc. The `[efforts,]` suffix is padded so
+        // brackets align across all rows.
+        let mut lines: Vec<(String, Option<String>)> = available_routes
+            .iter()
+            .filter(|route| crate::provider::is_listable_model_name(&route.model))
+            .map(|route| {
+                let provider_key =
+                    cli_config_provider_key_for_route(route, provider_name);
+                let spec = format!("{}:{}", provider_key, route.model);
+                let effort_str = efforts_for_model(&route.model)
+                    .filter(|e| !e.is_empty())
+                    .map(|e| format!("[{}]", e.join(", ")));
+                (spec, effort_str)
+            })
+            .collect();
+
+        // Sort by provider key, then model name.
+        lines.sort_by(|(a, _), (b, _)| a.cmp(b));
+        lines.dedup();
+
+        // Column width = longest `provider:model` string.
+        let col_width = lines.iter().map(|(spec, _)| spec.len()).max().unwrap_or(0);
+
         if verbose {
-            println!(
-                "Provider: {}",
-                crate::provider_catalog::runtime_provider_display_name(provider.name())
-            );
+            println!("Provider: {}", provider_display);
             println!("Selected model: {}", provider.model());
-            println!("Available models: {}", models.len());
+            println!("Available models: {}", lines.len());
             println!();
         }
-        for model in models {
-            println!("{}", model);
+
+        for (spec, effort_str) in &lines {
+            match effort_str {
+                Some(efforts) => println!("{:<col_width$}  {efforts}", spec),
+                None => println!("{spec}"),
+            }
         }
     }
 
@@ -3214,6 +3397,223 @@ pub async fn run_model_command(
 
 fn cli_api_method_display(raw: &str) -> String {
     crate::provider::ModelRouteApiMethod::parse(raw).display_label()
+}
+
+/// If the OpenAI API-key channel is actually pointing at a proxy gateway
+/// (detected via `OPENAI_BASE_URL`), reattribute routes from that channel to
+/// the matching OpenAI-compatible profile so they show the real provider key
+/// instead of `openai-api`.
+///
+/// For example, when `OPENAI_BASE_URL=https://opencode.ai/zen/go/v1`, routes
+/// show as `openai-compatible:opencode-go:minimax-m3` instead of
+/// `openai-api:minimax-m3`.
+///
+/// Additionally, non-OpenAI models that have a dedicated vendor profile
+/// (minimax, deepseek, z.ai, ...) get a second reattributed copy under that
+/// vendor profile so the model appears under both the proxy and the vendor.
+fn reattribute_route(route: &crate::provider::ModelRoute) -> crate::provider::ModelRoute {
+    if route.api_method_kind() != crate::provider::ModelRouteApiMethod::OpenAIApiKey {
+        return route.clone();
+    }
+
+    // Check if the "OpenAI API key" is actually a proxy gateway.
+    if let Some(profile_id) = proxy_profile_id_from_openai_base_url() {
+        return crate::provider::ModelRoute {
+            model: route.model.clone(),
+            provider: profile_display_name(&profile_id),
+            api_method: format!("openai-compatible:{profile_id}"),
+            available: route.available,
+            detail: route.detail.clone(),
+            cheapness: route.cheapness.clone(),
+        };
+    }
+
+    // No proxy detected: try to reattribute non-OpenAI models to their vendor
+    // profile (e.g. minimax-m3 → openai-compatible:minimax).
+    if crate::provider::provider_for_model(&route.model) == Some("openai") {
+        return route.clone();
+    }
+    let profile = match profile_id_for_model(&route.model) {
+        Some(p) => p,
+        None => return route.clone(),
+    };
+    crate::provider::ModelRoute {
+        model: route.model.clone(),
+        provider: profile_display_name(&profile),
+        api_method: format!("openai-compatible:{profile}"),
+        available: route.available,
+        detail: route.detail.clone(),
+        cheapness: route.cheapness.clone(),
+    }
+}
+
+/// Detect which OpenAI-compatible profile the OpenAI API-key channel is
+/// actually proxying by checking `OPENAI_BASE_URL` against known profile api
+/// bases. Returns the profile id when a match is found.
+fn proxy_profile_id_from_openai_base_url() -> Option<String> {
+    let base_url = std::env::var("OPENAI_BASE_URL").ok()?;
+    let base_url = base_url.trim();
+    if base_url.is_empty() {
+        return None;
+    }
+    crate::provider_catalog::openai_compatible_profile_id_for_api_base(base_url)
+        .map(String::from)
+}
+
+/// Profiles served by the same proxy endpoint as the detected profile.
+/// For example, `https://opencode.ai/zen/go/v1` serves both `opencode-go`
+/// and `opencode` (Zen) models, so the model list should show each model
+/// under both profiles.
+fn sibling_profile_ids(profile_id: &str) -> Vec<&'static str> {
+    match profile_id {
+        "opencode-go" => vec!["opencode"],
+        "opencode" => vec!["opencode-go"],
+        _ => vec![],
+    }
+}
+
+/// Best-effort: fetch the model list from a profile's `/models` endpoint using
+/// the same API key as the proxy. Returns model ids that the sibling endpoint
+/// serves (e.g. OpenCode Zen free models not available on the Go endpoint).
+async fn fetch_profile_models(profile_id: &str) -> anyhow::Result<Vec<String>> {
+    let profile = crate::provider_catalog::openai_compatible_profile_by_id(profile_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown profile: {profile_id}"))?;
+    let api_base = profile.api_base.trim();
+    let api_key = std::env::var("OPENAI_API_KEY").ok()
+        .or_else(|| crate::provider_catalog::load_api_key_from_env_or_config(
+            profile.api_key_env,
+            profile.env_file,
+        ));
+    let api_key = api_key.ok_or_else(|| anyhow::anyhow!("no API key for {profile_id}"))?;
+
+    let url = format!("{}/models", api_base.trim_end_matches('/'));
+    let client = crate::provider::shared_http_client();
+    let resp = client
+        .get(&url)
+        .bearer_auth(&api_key)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("sibling profile {} returned {}", profile_id, resp.status());
+    }
+    let body: serde_json::Value = resp.json().await?;
+    let models = body
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("id").and_then(|id| id.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(models)
+}
+
+/// Check whether an OpenAI-compatible vendor profile has its own API key
+/// configured (independent of the proxy). Only vendor profiles with their own
+/// credentials should show vendor-attributed model routes.
+fn vendor_profile_is_configured(profile_id: &str) -> bool {
+    crate::provider_catalog::openai_compatible_profile_by_id(profile_id)
+        .is_some_and(|profile| {
+            crate::provider_catalog::openai_compatible_profile_is_configured(profile)
+        })
+}
+
+/// Match a model name to an OpenAI-compatible profile id based on known
+/// model naming patterns.
+fn profile_id_for_model(model: &str) -> Option<&'static str> {
+    let lower = model.to_ascii_lowercase();
+    if lower.starts_with("glm-") || lower.contains("zhipu") {
+        return Some("zai");
+    }
+    if lower.starts_with("minimax") || lower.starts_with("minimax-m") {
+        return Some("minimax");
+    }
+    if lower.starts_with("deepseek") {
+        return Some("deepseek");
+    }
+    if lower.starts_with("kimi") {
+        return Some("moonshotai");
+    }
+    if lower.starts_with("grok") {
+        return Some("xai");
+    }
+    if lower.starts_with("mimo") {
+        return Some("xiaomi-mimo");
+    }
+    if lower.starts_with("qwen") {
+        return Some("alibaba-coding-plan");
+    }
+    if lower.starts_with("mistral") || lower.starts_with("codestral")
+        || lower.starts_with("devstral") || lower.starts_with("magistral")
+        || lower.starts_with("ministral")
+    {
+        return Some("mistral");
+    }
+    None
+}
+
+/// Display name for a profile id (used in the reattributed route's provider
+/// field). Looks up the profile's `display_name` from the catalog; falls back
+/// to the profile id itself.
+fn profile_display_name(profile_id: &str) -> String {
+    crate::provider_catalog::openai_compatible_profile_by_id(profile_id)
+        .map(|p| p.display_name.to_string())
+        .unwrap_or_else(|| profile_id.to_string())
+}
+
+/// Map a model to the provider key used in config files (e.g. `claude`,
+/// `openai`, `openai-compatible:zai`). This is the value a user would put in
+/// `default_provider` or a `[agents.preset.<name>.<agent>] model = "<key>:..."`
+/// line in config.toml.
+fn cli_config_provider_key_for_model(model: &str, fallback_provider: &str) -> String {
+    // Try the canonical model→provider mapping first (covers claude/openai).
+    // `provider_for_model` returns the lowercase provider key directly
+    // (e.g. "claude", "openai").
+    if let Some(provider_key) = crate::provider::provider_for_model(model) {
+        return provider_key.to_string();
+    }
+    // For models served through an OpenAI-compatible profile (z.ai, DeepSeek,
+    // Groq, ...), the runtime provider name is "OpenRouter" but the actual
+    // profile id is what users put in config. Check the active profile env.
+    if let Ok(profile) = std::env::var("JCODE_NAMED_PROVIDER_PROFILE")
+        && !profile.trim().is_empty()
+    {
+        return format!("openai-compatible:{}", profile.trim());
+    }
+    // Fall back to the raw provider name lowercased.
+    fallback_provider.to_ascii_lowercase()
+}
+
+/// Resolve the config provider key from a ModelRoute's api_method. This is
+/// more accurate than `cli_config_provider_key_for_model` because it uses the
+/// route's actual credential channel (e.g. an OpenAI-compatible profile like
+/// z.ai has `api_method = "openai-compatible:zai"`).
+fn cli_config_provider_key_for_route(
+    route: &crate::provider::ModelRoute,
+    fallback_provider: &str,
+) -> String {
+    let method = route.api_method_kind();
+    match &method {
+        crate::provider::ModelRouteApiMethod::ClaudeOAuth => "claude".to_string(),
+        crate::provider::ModelRouteApiMethod::AnthropicApiKey => "claude-api".to_string(),
+        crate::provider::ModelRouteApiMethod::OpenAIOAuth => "openai".to_string(),
+        crate::provider::ModelRouteApiMethod::OpenAIApiKey => "openai-api".to_string(),
+        crate::provider::ModelRouteApiMethod::OpenRouter => "openrouter".to_string(),
+        crate::provider::ModelRouteApiMethod::Copilot => "copilot".to_string(),
+        crate::provider::ModelRouteApiMethod::Cursor => "cursor".to_string(),
+        crate::provider::ModelRouteApiMethod::Bedrock => "bedrock".to_string(),
+        crate::provider::ModelRouteApiMethod::CodeAssistOAuth => "gemini".to_string(),
+        crate::provider::ModelRouteApiMethod::AntigravityHttps => "antigravity".to_string(),
+        crate::provider::ModelRouteApiMethod::JcodeSubscription => "jcode".to_string(),
+        crate::provider::ModelRouteApiMethod::OpenAiCompatible { profile_id } => {
+            match profile_id {
+                Some(id) => format!("openai-compatible:{}", id),
+                None => "openai-compatible".to_string(),
+            }
+        }
+        _ => cli_config_provider_key_for_model(&route.model, fallback_provider),
+    }
 }
 
 fn cli_route_provider_display(provider: &str, api_method: &str) -> String {
